@@ -112,6 +112,19 @@ async function main() {
         console.error(color(`[event] run end id=${evt.runId}${duration}\n`, "magenta"));
         return;
       }
+      if (phase === "compaction" && (!activeRunId || evt.runId === activeRunId)) {
+        const summaryChars =
+          typeof evt.data?.summaryChars === "number" ? evt.data.summaryChars : 0;
+        const dropped =
+          typeof evt.data?.droppedMessages === "number" ? evt.data.droppedMessages : 0;
+        console.error(
+          color(
+            `[event] compaction summary_chars=${summaryChars} dropped_messages=${dropped}`,
+            "magenta",
+          ),
+        );
+        return;
+      }
       if (phase === "error" && (!activeRunId || evt.runId === activeRunId)) {
         activeRunId = null;
         const meta = runMetaById.get(evt.runId) ?? {};

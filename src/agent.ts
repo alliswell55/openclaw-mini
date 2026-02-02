@@ -4,7 +4,7 @@
  * 5 大核心子系统:
  * 1. Session Manager - 会话管理 (JSONL 持久化)
  * 2. Memory Manager - 长期记忆 (关键词搜索)
- * 3. Context Loader - 按需上下文加载 (AGENT.md, HEARTBEAT.md)
+ * 3. Context Loader - 按需上下文加载 (AGENTS/SOUL/TOOLS/IDENTITY/USER/HEARTBEAT/BOOTSTRAP/MEMORY)
  * 4. Skill Manager - 可扩展技能系统
  * 5. Heartbeat Manager - 主动唤醒机制
  *
@@ -24,7 +24,13 @@ import type { Tool, ToolContext } from "./tools/types.js";
 import { builtinTools } from "./tools/builtin.js";
 import { SessionManager, type Message, type ContentBlock } from "./session.js";
 import { MemoryManager, type MemorySearchResult } from "./memory.js";
-import { ContextLoader } from "./context.js";
+import {
+  ContextLoader,
+  DEFAULT_CONTEXT_WINDOW_TOKENS,
+  compactHistoryIfNeeded,
+  pruneContextMessages,
+  type PruneResult,
+} from "./context/index.js";
 import { SkillManager, type SkillMatch } from "./skills.js";
 import { HeartbeatManager, type HeartbeatTask, type WakeRequest, type HeartbeatResult } from "./heartbeat.js";
 import {
@@ -76,6 +82,8 @@ export interface AgentConfig {
   enableHeartbeat?: boolean;
   /** Heartbeat 检查间隔 (毫秒) */
   heartbeatInterval?: number;
+  /** 上下文窗口大小（token 估算） */
+  contextTokens?: number;
 }
 
 export interface AgentCallbacks {
@@ -147,6 +155,7 @@ export class Agent {
   private maxTurns: number;
   private workspaceDir: string;
   private toolPolicy?: ToolPolicy;
+  private contextTokens: number;
   private sandbox?: {
     enabled: boolean;
     allowExec: boolean;
@@ -175,6 +184,10 @@ export class Agent {
     this.maxTurns = config.maxTurns ?? 20;
     this.workspaceDir = config.workspaceDir ?? process.cwd();
     this.toolPolicy = config.toolPolicy;
+    this.contextTokens = Math.max(
+      1,
+      Math.floor(config.contextTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS),
+    );
     this.sandbox = {
       enabled: config.sandbox?.enabled ?? false,
       allowExec: config.sandbox?.allowExec ?? false,
@@ -195,6 +208,44 @@ export class Agent {
     this.enableContext = config.enableContext ?? true;
     this.enableSkills = config.enableSkills ?? true;
     this.enableHeartbeat = config.enableHeartbeat ?? false; // 默认关闭自动唤醒
+  }
+
+  /**
+   * 上下文压缩：裁剪 + 可选摘要
+   */
+  private async prepareMessagesForRun(params: {
+    messages: Message[];
+    sessionKey: string;
+    runId: string;
+  }): Promise<{
+    pruned: PruneResult;
+    summaryMessage?: Message;
+  }> {
+    const compacted = await compactHistoryIfNeeded({
+      client: this.client,
+      model: this.model,
+      messages: params.messages,
+      contextWindowTokens: this.contextTokens,
+    });
+
+    if (compacted.summary && compacted.summaryMessage) {
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "lifecycle",
+        sessionKey: params.sessionKey,
+        agentId: this.agentId,
+        data: {
+          phase: "compaction",
+          summaryChars: compacted.summary.length,
+          droppedMessages: compacted.pruneResult.droppedMessages.length,
+        },
+      });
+    }
+
+    return {
+      pruned: compacted.pruneResult,
+      summaryMessage: compacted.summaryMessage,
+    };
   }
 
   /**
@@ -259,7 +310,6 @@ export class Agent {
     runPromise
       .then(async (result) => {
         const summary = result.text.slice(0, 600);
-        this.subagentSummaries.set(result.runId ?? childSessionKey, summary);
         emitAgentEvent({
           runId: result.runId ?? childSessionKey,
           stream: "subagent",
@@ -307,13 +357,15 @@ export class Agent {
   /**
    * 构建完整系统提示
    */
-  private async buildSystemPrompt(): Promise<string> {
+  private async buildSystemPrompt(params?: { sessionKey?: string }): Promise<string> {
     let prompt = this.baseSystemPrompt;
     const availableTools = new Set(this.resolveToolsForRun().map((t) => t.name));
 
     // 注入上下文
     if (this.enableContext) {
-      const contextPrompt = await this.context.buildContextPrompt();
+      const contextPrompt = await this.context.buildContextPrompt({
+        sessionKey: params?.sessionKey,
+      });
       if (contextPrompt) {
         prompt += contextPrompt;
       }
@@ -435,15 +487,36 @@ export class Agent {
         let totalToolCalls = 0;
         let finalText = "";
         const currentMessages = [...history, userMsg];
+        const prep = await this.prepareMessagesForRun({
+          messages: currentMessages,
+          sessionKey,
+          runId,
+        });
+        let compactionSummary = prep.summaryMessage;
+        let cachedPrune = prep.pruned;
+        let usedInitialPrune = false;
 
         // 构建系统提示
-        const systemPrompt = await this.buildSystemPrompt();
+        const systemPrompt = await this.buildSystemPrompt({ sessionKey });
         const toolsForRun = this.resolveToolsForRun();
 
         // ===== Agent Loop =====
         while (turns < this.maxTurns) {
           turns++;
           callbacks?.onTurnStart?.(turns);
+
+          const pruneResult = usedInitialPrune
+            ? pruneContextMessages({
+                messages: currentMessages,
+                contextWindowTokens: this.contextTokens,
+              })
+            : cachedPrune;
+          usedInitialPrune = true;
+          cachedPrune = pruneResult;
+          let messagesForModel = pruneResult.messages;
+          if (compactionSummary) {
+            messagesForModel = [compactionSummary, ...messagesForModel];
+          }
 
           // 调用 LLM (流式)
           const stream = this.client.messages.stream({
@@ -455,7 +528,7 @@ export class Agent {
               description: t.description,
               input_schema: t.inputSchema,
             })),
-            messages: currentMessages.map((m) => ({
+            messages: messagesForModel.map((m) => ({
               role: m.role,
               content: m.content,
             })) as Anthropic.MessageParam[],

@@ -46,7 +46,7 @@ export {
 } from "./memory.js";
 
 // 上下文加载
-export { ContextLoader, type ContextFile } from "./context.js";
+export { ContextLoader, type ContextFile } from "./context/index.js";
 
 // 技能系统
 export { SkillManager, type Skill, type SkillMatch } from "./skills.js";

@@ -37,9 +37,9 @@ OpenClaw 是一个 5 万行的生产级 Agent 系统，本项目从中提炼出 
 │  │   Context   │  │   Skills    │  │       Heartbeat         │   │
 │  │   Loader    │  │   Manager   │  │       Manager           │   │
 │  │             │  │             │  │  ┌─────────────────┐    │   │
-│  │ AGENT.md    │  │ SKILL.md    │  │  │ HeartbeatWake   │    │   │
-│  │ HEARTBEAT.md│  │ 触发词匹配  │  │  │ (请求合并层)    │    │   │
-│  │ CONTEXT.md  │  │ 内置+自定义 │  │  └────────┬────────┘    │   │
+│  │ AGENTS.md   │  │ SKILL.md    │  │  │ HeartbeatWake   │    │   │
+│  │ SOUL.md     │  │ 触发词匹配  │  │  │ (请求合并层)    │    │   │
+│  │ TOOLS.md... │  │ 内置+自定义 │  │  └────────┬────────┘    │   │
 │  └──────┬──────┘  └──────┬──────┘  │           │             │   │
 │         │                │         │  ┌────────▼────────┐    │   │
 │         │                │         │  │ HeartbeatRunner │    │   │
@@ -75,7 +75,7 @@ OpenClaw 是一个 5 万行的生产级 Agent 系统，本项目从中提炼出 
 |--------|--------|---------------|----------|
 | **Session** | `session.ts` | `src/agents/session-manager.ts` | 会话持久化 (JSONL)、历史管理 |
 | **Memory** | `memory.ts` | `src/memory/manager.ts` (76KB) | 长期记忆、语义检索 |
-| **Context** | `context.ts` | `src/agents/bootstrap-files.ts` | 按需加载 CLAUDE.md/HEARTBEAT.md |
+| **Context** | `context/loader.ts` | `src/agents/bootstrap-files.ts` | 按需加载 AGENTS/SOUL/TOOLS/IDENTITY/USER/HEARTBEAT/BOOTSTRAP/MEMORY |
 | **Skills** | `skills.ts` | `src/agents/skills/` | 可扩展技能、触发词匹配 |
 | **Heartbeat** | `heartbeat.ts` | `src/infra/heartbeat-runner.ts`<br>`src/infra/heartbeat-wake.ts` | 主动唤醒、事件驱动调度 |
 
@@ -134,18 +134,29 @@ async search(query: string, limit = 5): Promise<MemorySearchResult[]> {
 **问题**：如何注入项目级规范而不污染每次对话？
 
 **OpenClaw 方案** (`src/agents/bootstrap-files.ts`)：
-- `CLAUDE.md`：项目级长期规范
-- `HEARTBEAT.md`：主动唤醒任务清单
-- 层级加载：用户全局 → 工作空间 → .claude/ 目录
+- `AGENTS.md / SOUL.md / TOOLS.md / IDENTITY.md / USER.md / HEARTBEAT.md / BOOTSTRAP.md`
+- `MEMORY.md`（或 `memory.md`）作为记忆补充
+- 子代理仅允许 `AGENTS.md` + `TOOLS.md` 进入上下文
+- 超长文件按 head+tail 截断并加标记
 
-**本项目实现** (`context.ts:42-65`)：
+**本项目实现** (`context/loader.ts`)：
 ```typescript
-async loadAll(): Promise<ContextFile[]> {
-  // 1. 加载用户全局配置 (~/.openclaw-mini/AGENT.md)
-  // 2. 加载工作空间配置 (./AGENT.md)
-  // 3. 加载 .openclaw-mini/ 目录配置
+async buildContextPrompt(params?: { sessionKey?: string }): Promise<string> {
+  const files = await this.loadBootstrapFiles(params);
+  const contextFiles = buildBootstrapContextFiles(files, { maxChars: this.maxChars });
+  // Project Context 输出（含 SOUL.md 特殊提示）
 }
 ```
+
+### 3.1 Context Pruning/Compaction - 上下文压缩
+
+**OpenClaw 方案**：
+- `src/agents/pi-extensions/context-pruning/*`：裁剪工具结果、保留最近上下文
+- `src/agents/compaction.ts`：超长历史摘要压缩
+
+**本项目实现**：
+- `context/pruning.ts`：软裁剪 tool_result + 保留最近 assistant
+- `context/compaction.ts`：触发阈值后生成“历史摘要”并注入
 
 ### 4. Skills Manager - 可扩展技能
 
@@ -282,7 +293,9 @@ private schedule(delayMs: number): void {
 | `agent.ts` | ~320 | `src/agents/pi-embedded-runner/run.ts` | ~700 行 |
 | `session.ts` | ~110 | `src/agents/session-manager.ts` | ~500 行 |
 | `memory.ts` | ~170 | `src/memory/manager.ts` | 76KB |
-| `context.ts` | ~120 | `src/agents/bootstrap-files.ts` | ~300 行 |
+| `context/loader.ts` | ~150 | `src/agents/bootstrap-files.ts` | ~300 行 |
+| `context/pruning.ts` | ~220 | `src/agents/pi-extensions/context-pruning/pruner.ts` | ~450 行 |
+| `context/compaction.ts` | ~260 | `src/agents/compaction.ts` | ~380 行 |
 | `skills.ts` | ~230 | `src/agents/skills/` | ~2000 行 |
 | `heartbeat.ts` | ~400 | `src/infra/heartbeat-runner.ts`<br>`src/infra/heartbeat-wake.ts` | ~1500 行 |
 | `tools/*.ts` | ~210 | `src/tools/` | 50+ 工具 |
@@ -307,6 +320,15 @@ export OPENCLAW_MINI_AGENT_ID=main
 
 # 启动交互式对话
 pnpm dev chat
+```
+
+## 工作区模板（来自 OpenClaw 设计）
+
+模板放在 `examples/openclaw-mini/workspace-templates/`（内容参考 `docs/reference/templates/` 的设计），运行时会从**当前工作区根目录**读取这些文件。  
+需要生效时，把模板复制到工作区根目录即可：
+
+```bash
+cp examples/openclaw-mini/workspace-templates/* examples/openclaw-mini/
 ```
 
 ## 使用示例
@@ -363,11 +385,31 @@ openclaw/
 │   ├── infra/heartbeat-runner.ts    ← 对照 examples/openclaw-mini/src/heartbeat.ts
 │   ├── infra/heartbeat-wake.ts      ← 对照 examples/openclaw-mini/src/heartbeat.ts
 │   ├── memory/manager.ts            ← 对照 examples/openclaw-mini/src/memory.ts
-│   ├── agents/bootstrap-files.ts    ← 对照 examples/openclaw-mini/src/context.ts
+│   ├── agents/bootstrap-files.ts    ← 对照 examples/openclaw-mini/src/context/loader.ts
+│   ├── agents/compaction.ts         ← 对照 examples/openclaw-mini/src/context/compaction.ts
+│   ├── agents/pi-extensions/context-pruning/pruner.ts ← 对照 examples/openclaw-mini/src/context/pruning.ts
 │   └── agents/skills/               ← 对照 examples/openclaw-mini/src/skills.ts
 └── examples/
     └── openclaw-mini/               ← 本项目 (~800 行)
 ```
+
+## 精华设计索引（必学 4 点）
+
+1) **上下文的文件化结构**  
+   - OpenClaw：`src/agents/workspace.ts`（bootstrap 文件清单）  
+   - Mini：`examples/openclaw-mini/src/context/bootstrap.ts`
+
+2) **统一注入链路（Project Context）**  
+   - OpenClaw：`src/agents/system-prompt.ts`  
+   - Mini：`examples/openclaw-mini/src/context/loader.ts`
+
+3) **规模控制（截断 + 裁剪）**  
+   - OpenClaw：`src/agents/pi-embedded-helpers/bootstrap.ts` + `src/agents/pi-extensions/context-pruning/pruner.ts`  
+   - Mini：`examples/openclaw-mini/src/context/bootstrap.ts` + `examples/openclaw-mini/src/context/pruning.ts`
+
+4) **压缩继承（摘要）**  
+   - OpenClaw：`src/agents/compaction.ts`  
+   - Mini：`examples/openclaw-mini/src/context/compaction.ts`
 
 ## License
 
