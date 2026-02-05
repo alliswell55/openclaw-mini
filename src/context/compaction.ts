@@ -1,5 +1,5 @@
 import type Anthropic from "@anthropic-ai/sdk";
-import type { Message } from "../session.js";
+import { createCompactionSummaryMessage, type Message } from "../session.js";
 import {
   estimateMessageTokens,
   estimateMessagesTokens,
@@ -19,12 +19,151 @@ export const DEFAULT_SUMMARY_MAX_TOKENS = 900;
 const DEFAULT_SUMMARY_FALLBACK = "No prior history.";
 const DEFAULT_PARTS = 2;
 const MERGE_SUMMARIES_INSTRUCTIONS =
-  "Merge these partial summaries into a single cohesive summary. Preserve decisions," +
-  " TODOs, open questions, and any constraints.";
+  "将这些分段摘要合并为一个连贯的摘要。保留关键决策、TODO、未解决问题与约束条件。";
 
-const DEFAULT_SUMMARY_INSTRUCTIONS =
-  "总结以下对话历史，保留关键决策、TODO、未解决的问题、约束条件。" +
-  " 保持简洁但完整，避免无关细节。";
+const SUMMARIZATION_SYSTEM_PROMPT = `你是上下文摘要助手。你的任务是阅读用户与 AI 编程助手的对话，然后按照指定格式输出结构化摘要。
+
+不要继续对话。不要回答对话中的问题。只输出结构化摘要。`;
+
+const SUMMARIZATION_PROMPT = `以上消息是一段对话，请生成结构化的上下文检查点摘要，供后续模型继续工作使用。
+
+请严格使用以下格式：
+
+## 目标
+[用户想要完成什么？如果会话涉及多个任务，可列出多个目标]
+
+## 约束与偏好
+- [用户提到的任何约束、偏好或要求]
+- [若无则写“(无)”]
+
+## 进展
+### 已完成
+- [x] [已完成的任务/改动]
+
+### 进行中
+- [ ] [当前进行的工作]
+
+### 阻塞
+- [若有阻塞问题，写在这里]
+
+## 关键决策
+- **[决策]**: [简要原因]
+
+## 下一步
+1. [按顺序列出下一步应该做什么]
+
+## 关键信息
+- [继续工作所需的任何数据、示例或引用]
+- [若不适用则写“(无)”]
+
+每个部分保持简洁。保留精确的文件路径、函数名与错误信息。`;
+
+const UPDATE_SUMMARIZATION_PROMPT = `以上消息是需要纳入已有摘要的新对话内容。已有摘要位于 <previous-summary> 标签中。
+
+请在保留已有摘要信息的前提下进行更新。规则：
+- 保留已有摘要中的所有重要信息
+- 追加新进展、决策和上下文
+- 更新“进展”：已完成的事项从“进行中”移动到“已完成”
+- 根据新进展更新“下一步”
+- 保留精确的文件路径、函数名与错误信息
+- 若某些信息不再 relevant，可移除
+
+请严格使用以下格式：
+
+## 目标
+[保留已有目标，必要时补充新的目标]
+
+## 约束与偏好
+- [保留已有内容，新增发现的内容]
+
+## 进展
+### 已完成
+- [x] [包含之前已完成事项 + 新完成事项]
+
+### 进行中
+- [ ] [当前进行的工作]
+
+### 阻塞
+- [当前阻塞问题，若已解决可移除]
+
+## 关键决策
+- **[决策]**: [简要原因]（保留已有并补充新的）
+
+## 下一步
+1. [根据当前状态更新下一步]
+
+## 关键信息
+- [保留重要上下文，必要时补充新信息]
+
+每个部分保持简洁。保留精确的文件路径、函数名与错误信息。`;
+
+type FileOps = {
+  read: Set<string>;
+  written: Set<string>;
+  edited: Set<string>;
+};
+
+function createFileOps(): FileOps {
+  return {
+    read: new Set<string>(),
+    written: new Set<string>(),
+    edited: new Set<string>(),
+  };
+}
+
+function extractFileOpsFromMessage(message: Message, fileOps: FileOps): void {
+  if (message.role !== "assistant") {
+    return;
+  }
+  if (!Array.isArray(message.content)) {
+    return;
+  }
+  for (const block of message.content) {
+    if (block.type !== "tool_use") {
+      continue;
+    }
+    const args = block.input;
+    if (!args || typeof args !== "object") {
+      continue;
+    }
+    const path = typeof args.path === "string" ? args.path : undefined;
+    if (!path) {
+      continue;
+    }
+    switch (block.name) {
+      case "read":
+        fileOps.read.add(path);
+        break;
+      case "write":
+        fileOps.written.add(path);
+        break;
+      case "edit":
+        fileOps.edited.add(path);
+        break;
+    }
+  }
+}
+
+function computeFileLists(fileOps: FileOps): { readFiles: string[]; modifiedFiles: string[] } {
+  const modified = new Set<string>([...fileOps.edited, ...fileOps.written]);
+  const readOnly = [...fileOps.read].filter((file) => !modified.has(file)).sort();
+  const modifiedFiles = [...modified].sort();
+  return { readFiles: readOnly, modifiedFiles };
+}
+
+function formatFileOperations(readFiles: string[], modifiedFiles: string[]): string {
+  const sections: string[] = [];
+  if (readFiles.length > 0) {
+    sections.push(`<read-files>\n${readFiles.join("\n")}\n</read-files>`);
+  }
+  if (modifiedFiles.length > 0) {
+    sections.push(`<modified-files>\n${modifiedFiles.join("\n")}\n</modified-files>`);
+  }
+  if (sections.length === 0) {
+    return "";
+  }
+  return `\n\n${sections.join("\n\n")}`;
+}
 
 type SummaryClient = Pick<Anthropic, "messages">;
 
@@ -123,43 +262,67 @@ function isOversizedForSummary(msg: Message, contextWindow: number): boolean {
   return tokens > contextWindow * 0.5;
 }
 
-function formatMessageContent(msg: Message): string {
-  if (typeof msg.content === "string") {
-    return msg.content;
+function extractUserText(content: Message["content"]): string {
+  if (typeof content === "string") {
+    return content;
   }
-  const parts: string[] = [];
-  for (const block of msg.content) {
-    if (block.type === "text") {
-      if (block.text) parts.push(block.text);
-      continue;
-    }
-    if (block.type === "tool_use") {
-      const name = block.name ?? "tool";
-      const input = (() => {
-        try {
-          return block.input ? JSON.stringify(block.input) : "";
-        } catch {
-          return "";
-        }
-      })();
-      parts.push(`[tool_use ${name}] ${input}`);
-      continue;
-    }
-    if (block.type === "tool_result") {
-      parts.push(`[tool_result] ${block.content ?? ""}`);
-    }
-  }
-  return parts.join("\n");
+  return content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text ?? "")
+    .join("");
 }
 
-function formatMessagesForSummary(messages: Message[]): string {
-  return messages
-    .map((msg) => {
-      const role = msg.role;
-      const content = formatMessageContent(msg);
-      return `${role}: ${content}`;
-    })
-    .join("\n");
+function serializeConversation(messages: Message[]): string {
+  const parts: string[] = [];
+  for (const msg of messages) {
+    if (msg.role === "user") {
+      const text = extractUserText(msg.content);
+      if (text) {
+        parts.push(`[User]: ${text}`);
+      }
+      if (Array.isArray(msg.content)) {
+        const toolResults = msg.content
+          .filter((block) => block.type === "tool_result")
+          .map((block) => block.content ?? "")
+          .filter(Boolean);
+        for (const result of toolResults) {
+          parts.push(`[Tool result]: ${result}`);
+        }
+      }
+      continue;
+    }
+
+    if (msg.role === "assistant") {
+      const textParts: string[] = [];
+      const toolCalls: string[] = [];
+      if (typeof msg.content === "string") {
+        textParts.push(msg.content);
+      } else {
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            if (block.text) {
+              textParts.push(block.text);
+            }
+            continue;
+          }
+          if (block.type === "tool_use") {
+            const args = block.input ?? {};
+            const argsStr = Object.entries(args)
+              .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+              .join(", ");
+            toolCalls.push(`${block.name ?? "tool"}(${argsStr})`);
+          }
+        }
+      }
+      if (textParts.length > 0) {
+        parts.push(`[Assistant]: ${textParts.join("\n")}`);
+      }
+      if (toolCalls.length > 0) {
+        parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
+      }
+    }
+  }
+  return parts.join("\n\n");
 }
 
 async function generateSummary(params: {
@@ -170,17 +333,21 @@ async function generateSummary(params: {
   customInstructions?: string;
   previousSummary?: string;
 }): Promise<string> {
-  const baseInstructions = params.customInstructions ?? DEFAULT_SUMMARY_INSTRUCTIONS;
-  const previous = params.previousSummary
-    ? `已有摘要：\n${params.previousSummary}\n\n`
-    : "";
-  const transcript = formatMessagesForSummary(params.messages);
-  const prompt = `${baseInstructions}\n\n${previous}对话片段：\n${transcript}\n\n输出：`;
+  let basePrompt = params.previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+  if (params.customInstructions) {
+    basePrompt = `${basePrompt}\n\nAdditional focus: ${params.customInstructions}`;
+  }
+  const conversationText = serializeConversation(params.messages);
+  let prompt = `<conversation>\n${conversationText}\n</conversation>\n\n`;
+  if (params.previousSummary) {
+    prompt += `<previous-summary>\n${params.previousSummary}\n</previous-summary>\n\n`;
+  }
+  prompt += basePrompt;
 
   const response = await params.client.messages.create({
     model: params.model,
     max_tokens: params.maxTokens,
-    system: "你是一个对话摘要器，输出简洁、准确的总结。",
+    system: SUMMARIZATION_SYSTEM_PROMPT,
     messages: [
       {
         role: "user",
@@ -403,19 +570,21 @@ export async function compactHistoryIfNeeded(params: {
     return { pruneResult };
   }
 
-  const summary = await buildCompactionSummary({
+  let summary = await buildCompactionSummary({
     client: params.client,
     model: params.model,
     messages: pruneResult.droppedMessages,
     contextWindowTokens: params.contextWindowTokens,
     maxTokens: params.maxTokens,
   });
+  const fileOps = createFileOps();
+  for (const message of pruneResult.droppedMessages) {
+    extractFileOpsFromMessage(message, fileOps);
+  }
+  const { readFiles, modifiedFiles } = computeFileLists(fileOps);
+  summary += formatFileOperations(readFiles, modifiedFiles);
 
-  const summaryMessage: Message = {
-    role: "assistant",
-    content: `【历史摘要】\n${summary}`,
-    timestamp: Date.now(),
-  };
+  const summaryMessage: Message = createCompactionSummaryMessage(summary, Date.now());
 
   return {
     summary,

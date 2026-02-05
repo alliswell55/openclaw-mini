@@ -29,8 +29,15 @@ import {
   DEFAULT_CONTEXT_WINDOW_TOKENS,
   compactHistoryIfNeeded,
   pruneContextMessages,
+  estimateMessagesTokens,
   type PruneResult,
 } from "./context/index.js";
+import {
+  CONTEXT_WINDOW_HARD_MIN_TOKENS,
+  CONTEXT_WINDOW_WARN_BELOW_TOKENS,
+  evaluateContextWindowGuard,
+  resolveContextWindowInfo,
+} from "./context-window-guard.js";
 import { SkillManager, type SkillMatch } from "./skills.js";
 import { HeartbeatManager, type HeartbeatTask, type WakeRequest, type HeartbeatResult } from "./heartbeat.js";
 import {
@@ -219,6 +226,7 @@ export class Agent {
     runId: string;
   }): Promise<{
     pruned: PruneResult;
+    summary?: string;
     summaryMessage?: Message;
   }> {
     const compacted = await compactHistoryIfNeeded({
@@ -244,6 +252,7 @@ export class Agent {
 
     return {
       pruned: compacted.pruneResult,
+      summary: compacted.summary,
       summaryMessage: compacted.summaryMessage,
     };
   }
@@ -426,6 +435,26 @@ export class Agent {
           },
         });
         try {
+        const ctxInfo = resolveContextWindowInfo({
+          contextTokens: this.contextTokens,
+          defaultTokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+        });
+        const ctxGuard = evaluateContextWindowGuard({
+          info: ctxInfo,
+          warnBelowTokens: CONTEXT_WINDOW_WARN_BELOW_TOKENS,
+          hardMinTokens: CONTEXT_WINDOW_HARD_MIN_TOKENS,
+        });
+        if (ctxGuard.shouldWarn) {
+          console.warn(
+            `上下文窗口偏小: ctx=${ctxGuard.tokens} (warn<${CONTEXT_WINDOW_WARN_BELOW_TOKENS}) source=${ctxGuard.source}`,
+          );
+        }
+        if (ctxGuard.shouldBlock) {
+          throw new Error(
+            `上下文窗口过小 (${ctxGuard.tokens} tokens)，最低要求 ${CONTEXT_WINDOW_HARD_MIN_TOKENS} tokens。`,
+          );
+        }
+
         // 加载历史
         const history = await this.sessions.load(sessionKey);
 
@@ -495,6 +524,27 @@ export class Agent {
         let compactionSummary = prep.summaryMessage;
         let cachedPrune = prep.pruned;
         let usedInitialPrune = false;
+        if (prep.summary) {
+          let firstKeptEntryId: string | undefined;
+          for (const msg of prep.pruned.messages) {
+            const candidate = this.sessions.resolveMessageEntryId(sessionKey, msg);
+            if (candidate) {
+              firstKeptEntryId = candidate;
+              break;
+            }
+          }
+          if (firstKeptEntryId) {
+            const tokensBefore = estimateMessagesTokens(currentMessages);
+            await this.sessions.appendCompaction(
+              sessionKey,
+              prep.summary,
+              firstKeptEntryId,
+              tokensBefore,
+            );
+          } else {
+            console.warn("无法定位 compaction 的 firstKeptEntryId，已跳过记录。");
+          }
+        }
 
         // 构建系统提示
         const systemPrompt = await this.buildSystemPrompt({ sessionKey });

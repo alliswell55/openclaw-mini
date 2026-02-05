@@ -22,6 +22,7 @@
  *    - 必须清理为安全的文件名
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -61,17 +62,67 @@ export interface ContentBlock {
   content?: string;
 }
 
+// ============== Session Entry 结构（对齐 OpenClaw） ==============
+
+export const CURRENT_SESSION_VERSION = 3;
+
+export interface SessionHeaderEntry {
+  type: "session";
+  version: number;
+  id: string;
+  timestamp: string;
+  cwd?: string;
+}
+
+export interface SessionEntryBase {
+  type: string;
+  id: string;
+  parentId: string | null;
+  timestamp: string;
+}
+
+export interface MessageEntry extends SessionEntryBase {
+  type: "message";
+  message: Message;
+}
+
+export interface CompactionEntry extends SessionEntryBase {
+  type: "compaction";
+  summary: string;
+  firstKeptEntryId: string;
+  tokensBefore: number;
+}
+
+export type SessionEntry = MessageEntry | CompactionEntry;
+export type SessionFileEntry = SessionHeaderEntry | SessionEntry;
+
+// 与 OpenClaw 一致的摘要前缀/后缀
+export const COMPACTION_SUMMARY_PREFIX =
+  "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+export const COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
+
+export function createCompactionSummaryMessage(summary: string, timestamp?: string | number): Message {
+  const resolvedTimestamp =
+    typeof timestamp === "string"
+      ? new Date(timestamp).getTime()
+      : typeof timestamp === "number"
+        ? timestamp
+        : Date.now();
+  return {
+    role: "user",
+    content: `${COMPACTION_SUMMARY_PREFIX}${summary}${COMPACTION_SUMMARY_SUFFIX}`,
+    timestamp: Number.isFinite(resolvedTimestamp) ? resolvedTimestamp : Date.now(),
+  };
+}
+
 // ============== 会话管理器 ==============
 
 export class SessionManager {
   /** 会话文件存储目录 */
   private baseDir: string;
 
-  /**
-   * 内存缓存
-   * 为什么需要？避免每次 get() 都读磁盘，Agent Loop 中会频繁读取历史
-   */
-  private cache = new Map<string, Message[]>();
+  /** Session 缓存（避免重复加载/解析） */
+  private states = new Map<string, SessionState>();
 
   constructor(baseDir: string = "./.openclaw-mini/sessions") {
     this.baseDir = baseDir;
@@ -93,6 +144,16 @@ export class SessionManager {
     return path.join(this.baseDir, `${safeId}.jsonl`);
   }
 
+  private createHeader(): SessionHeaderEntry {
+    return {
+      type: "session",
+      version: CURRENT_SESSION_VERSION,
+      id: crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+    };
+  }
+
   /**
    * 加载会话历史
    *
@@ -100,33 +161,8 @@ export class SessionManager {
    * 这是典型的 Cache-Aside 模式
    */
   async load(sessionKey: string): Promise<Message[]> {
-    // 1. 检查缓存
-    if (this.cache.has(sessionKey)) {
-      return this.cache.get(sessionKey)!;
-    }
-
-    // 2. 从磁盘加载 JSONL 文件
-    const filePath = this.getPath(sessionKey);
-    try {
-      const content = await fs.readFile(filePath, "utf-8");
-      const messages = parseJsonl(content);
-      // 3. 写入缓存
-      this.cache.set(sessionKey, messages);
-      return messages;
-    } catch {
-      // 兼容旧命名（下划线替换）
-      try {
-        const legacyPath = this.getLegacyPath(sessionKey);
-        const legacyContent = await fs.readFile(legacyPath, "utf-8");
-        const messages = parseJsonl(legacyContent);
-        this.cache.set(sessionKey, messages);
-        return messages;
-      } catch {
-        // 文件不存在，返回空数组
-        this.cache.set(sessionKey, []);
-        return [];
-      }
-    }
+    const state = await this.ensureState(sessionKey);
+    return buildSessionContext(state);
   }
 
   /**
@@ -141,15 +177,76 @@ export class SessionManager {
    * - 写入是 O(1)，无论文件多大
    */
   async append(sessionKey: string, message: Message): Promise<void> {
-    // 1. 更新内存缓存
-    const messages = this.cache.get(sessionKey) ?? [];
-    messages.push(message);
-    this.cache.set(sessionKey, messages);
+    const state = await this.ensureState(sessionKey);
+    const entry: MessageEntry = {
+      type: "message",
+      id: generateId(state.byId),
+      parentId: state.leafId,
+      timestamp: new Date().toISOString(),
+      message,
+    };
+    state.entries.push(entry);
+    state.byId.set(entry.id, entry);
+    state.messageIdByRef.set(message, entry.id);
+    state.leafId = entry.id;
+    if (message.role === "assistant") {
+      state.hasAssistant = true;
+    }
+    await this.persistEntry(state, entry);
+  }
 
-    // 2. 追加写入磁盘
-    const filePath = this.getPath(sessionKey);
-    await fs.mkdir(this.baseDir, { recursive: true });
-    await fs.appendFile(filePath, JSON.stringify(message) + "\n");
+  /**
+   * 追加 compaction 记录（对齐 OpenClaw）
+   */
+  async appendCompaction(
+    sessionKey: string,
+    summary: string,
+    firstKeptEntryId: string,
+    tokensBefore: number,
+  ): Promise<void> {
+    const state = await this.ensureState(sessionKey);
+    const entry: CompactionEntry = {
+      type: "compaction",
+      id: generateId(state.byId),
+      parentId: state.leafId,
+      timestamp: new Date().toISOString(),
+      summary,
+      firstKeptEntryId,
+      tokensBefore,
+    };
+    state.entries.push(entry);
+    state.byId.set(entry.id, entry);
+    state.leafId = entry.id;
+    await this.persistEntry(state, entry);
+  }
+
+  /**
+   * 根据 Message 找到对应的 entryId
+   * - 先走引用映射
+   * - 再按 timestamp + role 兜底
+   */
+  resolveMessageEntryId(sessionKey: string, message: Message): string | undefined {
+    if (typeof message.content === "string") {
+      const trimmed = message.content.trimStart();
+      if (trimmed.startsWith(COMPACTION_SUMMARY_PREFIX)) {
+        return undefined;
+      }
+    }
+    const state = this.states.get(sessionKey);
+    if (!state) {
+      return undefined;
+    }
+    const direct = state.messageIdByRef.get(message);
+    if (direct) {
+      return direct;
+    }
+    for (const entry of state.entries) {
+      if (entry.type !== "message") continue;
+      if (entry.message.timestamp === message.timestamp && entry.message.role === message.role) {
+        return entry.id;
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -157,7 +254,11 @@ export class SessionManager {
    * 用于快速读取，不触发磁盘 IO
    */
   get(sessionKey: string): Message[] {
-    return this.cache.get(sessionKey) ?? [];
+    const state = this.states.get(sessionKey);
+    if (!state) {
+      return [];
+    }
+    return buildSessionContext(state);
   }
 
   /**
@@ -165,7 +266,7 @@ export class SessionManager {
    * 同时清理内存缓存和磁盘文件
    */
   async clear(sessionKey: string): Promise<void> {
-    this.cache.delete(sessionKey);
+    this.states.delete(sessionKey);
     const filePath = this.getPath(sessionKey);
     try {
       await fs.unlink(filePath);
@@ -202,21 +303,315 @@ export class SessionManager {
       return [];
     }
   }
+
+  private async ensureState(sessionKey: string): Promise<SessionState> {
+    const cached = this.states.get(sessionKey);
+    if (cached) {
+      return cached;
+    }
+
+    const filePath = this.getPath(sessionKey);
+    const legacyPath = this.getLegacyPath(sessionKey);
+    let chosenPath = filePath;
+    let state: SessionState | undefined;
+
+    try {
+      const loaded = await loadSessionFile(filePath);
+      if (loaded.header) {
+        state = buildStateFromEntries(filePath, loaded.header, loaded.entries);
+      } else if (loaded.legacyMessages) {
+        state = buildStateFromLegacy(filePath, loaded.legacyMessages);
+        if (state.hasAssistant || state.entries.length > 0) {
+          await rewriteSessionFile(state, this.baseDir);
+          state.flushed = true;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    if (!state) {
+      try {
+        const loaded = await loadSessionFile(legacyPath);
+        if (loaded.header) {
+          chosenPath = legacyPath;
+          state = buildStateFromEntries(legacyPath, loaded.header, loaded.entries);
+        } else if (loaded.legacyMessages) {
+          chosenPath = legacyPath;
+          state = buildStateFromLegacy(legacyPath, loaded.legacyMessages);
+          if (state.hasAssistant || state.entries.length > 0) {
+            await rewriteSessionFile(state, this.baseDir);
+            state.flushed = true;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (!state) {
+      const header = this.createHeader();
+      state = {
+        filePath: chosenPath,
+        header,
+        entries: [],
+        byId: new Map<string, SessionEntry>(),
+        messageIdByRef: new WeakMap<Message, string>(),
+        leafId: null,
+        flushed: false,
+        hasAssistant: false,
+      };
+    }
+
+    this.states.set(sessionKey, state);
+    return state;
+  }
+
+  private async persistEntry(state: SessionState, entry: SessionEntry): Promise<void> {
+    if (!state.hasAssistant) {
+      return;
+    }
+    if (!state.flushed) {
+      await rewriteSessionFile(state, this.baseDir);
+      state.flushed = true;
+      return;
+    }
+    await fs.mkdir(this.baseDir, { recursive: true });
+    await fs.appendFile(state.filePath, `${JSON.stringify(entry)}\n`);
+  }
 }
 
-function parseJsonl(content: string): Message[] {
-  const messages: Message[] = [];
+type SessionState = {
+  filePath: string;
+  header: SessionHeaderEntry;
+  entries: SessionEntry[];
+  byId: Map<string, SessionEntry>;
+  messageIdByRef: WeakMap<Message, string>;
+  leafId: string | null;
+  flushed: boolean;
+  hasAssistant: boolean;
+};
+
+function generateId(byId: { has(id: string): boolean }): string {
+  for (let i = 0; i < 100; i++) {
+    const id = crypto.randomUUID().slice(0, 8);
+    if (!byId.has(id)) return id;
+  }
+  return crypto.randomUUID();
+}
+
+function isSessionHeader(value: unknown): value is SessionHeaderEntry {
+  if (!value || typeof value !== "object") return false;
+  const header = value as SessionHeaderEntry;
+  return header.type === "session" && typeof header.id === "string";
+}
+
+function isLegacyMessage(value: unknown): value is Message {
+  if (!value || typeof value !== "object") return false;
+  const msg = value as Message;
+  if (msg.role !== "user" && msg.role !== "assistant") return false;
+  if (!("content" in msg)) return false;
+  return typeof msg.timestamp === "number";
+}
+
+function parseJsonlLines(content: string): unknown[] {
+  const entries: unknown[] = [];
   const lines = content.split("\n");
   for (const line of lines) {
     const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
-    }
+    if (!trimmed) continue;
     try {
-      messages.push(JSON.parse(trimmed) as Message);
+      entries.push(JSON.parse(trimmed));
     } catch {
       // 跳过损坏行，尽量保留其他记录
     }
   }
+  return entries;
+}
+
+function buildSessionContext(state: SessionState): Message[] {
+  if (state.entries.length === 0) {
+    return [];
+  }
+
+  if (state.leafId === null) {
+    return [];
+  }
+
+  const leaf = state.leafId ? state.byId.get(state.leafId) : state.entries[state.entries.length - 1];
+  if (!leaf) {
+    return [];
+  }
+
+  const path: SessionEntry[] = [];
+  let current: SessionEntry | undefined = leaf;
+  while (current) {
+    path.unshift(current);
+    current = current.parentId ? state.byId.get(current.parentId) : undefined;
+  }
+
+  let compaction: CompactionEntry | null = null;
+  for (const entry of path) {
+    if (entry.type === "compaction") {
+      compaction = entry;
+    }
+  }
+
+  const messages: Message[] = [];
+  const appendMessage = (entry: SessionEntry) => {
+    if (entry.type === "message") {
+      messages.push(entry.message);
+    }
+  };
+
+  if (compaction) {
+    messages.push(createCompactionSummaryMessage(compaction.summary, compaction.timestamp));
+    const compactionIdx = path.findIndex(
+      (entry) => entry.type === "compaction" && entry.id === compaction.id,
+    );
+    let foundFirstKept = false;
+    for (let i = 0; i < compactionIdx; i++) {
+      const entry = path[i];
+      if (entry.id === compaction.firstKeptEntryId) {
+        foundFirstKept = true;
+      }
+      if (foundFirstKept) {
+        appendMessage(entry);
+      }
+    }
+    for (let i = compactionIdx + 1; i < path.length; i++) {
+      appendMessage(path[i]);
+    }
+  } else {
+    for (const entry of path) {
+      appendMessage(entry);
+    }
+  }
+
   return messages;
+}
+
+async function loadSessionFile(
+  filePath: string,
+): Promise<{ header?: SessionHeaderEntry; entries: SessionEntry[]; legacyMessages?: Message[] }> {
+  const content = await fs.readFile(filePath, "utf-8");
+  const rawEntries = parseJsonlLines(content);
+
+  if (rawEntries.length === 0) {
+    return { entries: [] };
+  }
+
+  const [first, ...rest] = rawEntries;
+  if (!isSessionHeader(first)) {
+    const messages = rawEntries.filter(isLegacyMessage);
+    return { entries: [], legacyMessages: messages };
+  }
+
+  const header: SessionHeaderEntry = {
+    ...first,
+    version: typeof first.version === "number" ? first.version : CURRENT_SESSION_VERSION,
+  };
+  const entries: SessionEntry[] = [];
+
+  for (const entry of rest) {
+    if (!entry || typeof entry !== "object") continue;
+    const typed = entry as SessionEntry;
+    if (!typed.type || typeof typed.id !== "string") continue;
+    if (typed.type === "message" && (typed as MessageEntry).message) {
+      entries.push(typed);
+      continue;
+    }
+    if (
+      typed.type === "compaction" &&
+      typeof (typed as CompactionEntry).summary === "string" &&
+      typeof (typed as CompactionEntry).firstKeptEntryId === "string"
+    ) {
+      entries.push(typed);
+    }
+  }
+
+  return { header, entries };
+}
+
+function buildStateFromEntries(filePath: string, header: SessionHeaderEntry, entries: SessionEntry[]): SessionState {
+  const byId = new Map<string, SessionEntry>();
+  const messageIdByRef = new WeakMap<Message, string>();
+  let leafId: string | null = null;
+  let hasAssistant = false;
+
+  for (const entry of entries) {
+    byId.set(entry.id, entry);
+    leafId = entry.id;
+    if (entry.type === "message") {
+      messageIdByRef.set(entry.message, entry.id);
+      if (entry.message.role === "assistant") {
+        hasAssistant = true;
+      }
+    }
+  }
+
+  return {
+    filePath,
+    header,
+    entries,
+    byId,
+    messageIdByRef,
+    leafId,
+    flushed: true,
+    hasAssistant,
+  };
+}
+
+function buildStateFromLegacy(filePath: string, messages: Message[]): SessionState {
+  const header = {
+    type: "session",
+    version: CURRENT_SESSION_VERSION,
+    id: crypto.randomUUID(),
+    timestamp: new Date().toISOString(),
+    cwd: process.cwd(),
+  } satisfies SessionHeaderEntry;
+  const entries: SessionEntry[] = [];
+  const byId = new Map<string, SessionEntry>();
+  const messageIdByRef = new WeakMap<Message, string>();
+  let leafId: string | null = null;
+  let hasAssistant = false;
+
+  for (const message of messages) {
+    const entry: MessageEntry = {
+      type: "message",
+      id: generateId(byId),
+      parentId: leafId,
+      timestamp: new Date().toISOString(),
+      message: {
+        role: message.role,
+        content: message.content,
+        timestamp: typeof message.timestamp === "number" ? message.timestamp : Date.now(),
+      },
+    };
+    entries.push(entry);
+    byId.set(entry.id, entry);
+    messageIdByRef.set(entry.message, entry.id);
+    leafId = entry.id;
+    if (entry.message.role === "assistant") {
+      hasAssistant = true;
+    }
+  }
+
+  return {
+    filePath,
+    header,
+    entries,
+    byId,
+    messageIdByRef,
+    leafId,
+    flushed: false,
+    hasAssistant,
+  };
+}
+
+async function rewriteSessionFile(state: SessionState, baseDir: string): Promise<void> {
+  await fs.mkdir(baseDir, { recursive: true });
+  const lines = [state.header, ...state.entries].map((entry) => JSON.stringify(entry));
+  const content = `${lines.join("\n")}\n`;
+  await fs.writeFile(state.filePath, content);
 }
